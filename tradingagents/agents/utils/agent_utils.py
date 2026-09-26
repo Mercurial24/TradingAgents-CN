@@ -23,6 +23,22 @@ from tradingagents.utils.logging_manager import get_logger
 logger = get_logger('agents')
 
 
+def _default_finance_window(begin_date, end_date):
+    """财报类 MCP 工具的缺省日期窗口:近3年,避免 begin/end 落空或 begin=end 单日窗。
+
+    AmazingData 财报接口的 begin_date/end_date 是"报告期窗口"且 balance 要求两者成对提供;
+    单日窗(如 2023-12-31..2023-12-31)在 balance 上会取空,模型漏传日期时服务端会报错。
+    """
+    today = date.today()
+    if begin_date and not end_date:
+        return begin_date, today.strftime("%Y-%m-%d")
+    if end_date and not begin_date:
+        return f"{int(str(end_date)[:4]) - 3}-01-01", end_date
+    if not begin_date and not end_date:
+        return f"{today.year - 3}-01-01", today.strftime("%Y-%m-%d")
+    return begin_date, end_date
+
+
 def create_msg_delete(messages_key="messages"):
     def delete_messages(state):
         """Clear 指定分析师的messages通道并添加占位消息(兼容Anthropic)"""
@@ -149,6 +165,182 @@ class Toolkit:
         except Exception as e:
             # 如果中国平台数据获取失败，回退到原有的Reddit数据
             return interface.get_reddit_company_news(ticker, curr_date, 7, 5)
+
+    # ------------------------------------------------------------------
+    # 星耀数智 MCP 活数据工具(AmazingData,阶段 1 桥接)
+    # 全部走 mcp_client.call_tool:每次调用起独立子进程 + 全局锁串行(单点登录)。
+    # 代码必须带交易所后缀(000001.SZ / 600000.SH / 899050.BJ),否则报错。
+    # ------------------------------------------------------------------
+    @staticmethod
+    @tool
+    def mcp_kline(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+        begin_date: Annotated[str, "开始日期,格式 yyyy-mm-dd"],
+        end_date: Annotated[str, "结束日期,格式 yyyy-mm-dd"],
+        period: Annotated[str, "K线周期:day/min1/min5/day/week/month等,默认day"] = "day",
+    ) -> str:
+        """星耀数智 MCP 行情K线:查询沪深A股/指数/ETF/可转债/期货的K线(活数据)。
+        适合分析价格走势、成交量、技术形态;代码必须带 .SZ/.SH/.BJ 后缀。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        result = mcp_client.call_tool(
+            "mcp_kline",
+            codes=codes,
+            begin_date=begin_date,
+            end_date=end_date,
+            period=period,
+        )
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_snapshot(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+    ) -> str:
+        """星耀数智 MCP 实时快照:当前价、涨跌幅、五档盘口、涨停/跌停、成交量等实时盘口。
+        适合判断当下买卖氛围与多空力量;代码必须带 .SZ/.SH/.BJ 后缀。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        result = mcp_client.call_tool("mcp_snapshot", codes=codes)
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_calendar(
+        market: Annotated[str, "市场:SH/SZ/BJ,默认SH"] = "SH",
+        date: Annotated[str, "查询日期 yyyy-mm-dd,默认最近交易日"] = None,
+    ) -> str:
+        """星耀数智 MCP 交易日历:某市场在某日期是否为交易日,以及节假日安排。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        result = mcp_client.call_tool(
+            "mcp_calendar", market=market, date=mcp_client.to_int_date(date)
+        )
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_stock_basic(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+        summary_only: Annotated[bool, "只返回摘要(基本/基础信息)而非全部字段"] = False,
+    ) -> str:
+        """星耀数智 MCP 股票基本信息:证券简称、上市状态、所属行业、总股本/流通股本等。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        result = mcp_client.call_tool("mcp_stock_basic", codes=codes, summary_only=summary_only)
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_backward_factor(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+    ) -> str:
+        """星耀数智 MCP 后复权因子:用于把原始K线校准到复权口径,计算真实收益率。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        result = mcp_client.call_tool("mcp_backward_factor", codes=codes)
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_income(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+        begin_date: Annotated[str, "报告期起始 yyyy-mm-dd,如 2023-01-01,默认1990"] = None,
+        end_date: Annotated[str, "报告期截止 yyyy-mm-dd,如 2024-12-31"] = None,
+        statement_type: Annotated[str, "报表类型:1=合并报表,2=母公司"] = "1",
+        report_type: Annotated[str, "报告期类型:1=一季报,2=中报,3=三季报,4=年报"] = "4",
+    ) -> str:
+        """星耀数智 MCP 利润表:营业收入、净利润、扣非、毛利率等(按报告期)。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        begin_date, end_date = _default_finance_window(begin_date, end_date)
+        result = mcp_client.call_tool(
+            "mcp_income",
+            codes=codes,
+            begin_date=begin_date,
+            end_date=end_date,
+            statement_type=statement_type,
+            report_type=report_type,
+        )
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_balance_sheet(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+        begin_date: Annotated[str, "报告期起始 yyyy-mm-dd,默认1990"] = None,
+        end_date: Annotated[str, "报告期截止 yyyy-mm-dd"] = None,
+        statement_type: Annotated[str, "报表类型:1=合并报表,2=母公司"] = "1",
+        report_type: Annotated[str, "报告期类型:1=一季报,2=中报,3=三季报,4=年报"] = "4",
+    ) -> str:
+        """星耀数智 MCP 资产负债表:货币资金、应收账款、存货、负债、权益、商誉等。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        begin_date, end_date = _default_finance_window(begin_date, end_date)
+        result = mcp_client.call_tool(
+            "mcp_balance_sheet",
+            codes=codes,
+            begin_date=begin_date,
+            end_date=end_date,
+            statement_type=statement_type,
+            report_type=report_type,
+        )
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_cash_flow(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+        begin_date: Annotated[str, "报告期起始 yyyy-mm-dd,默认1990"] = None,
+        end_date: Annotated[str, "报告期截止 yyyy-mm-dd"] = None,
+        statement_type: Annotated[str, "报表类型:1=合并报表,2=母公司"] = "1",
+        report_type: Annotated[str, "报告期类型:1=一季报,2=中报,3=三季报,4=年报"] = "4",
+    ) -> str:
+        """星耀数智 MCP 现金流量表:经营/投资/筹资现金流净额、收现比等。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        begin_date, end_date = _default_finance_window(begin_date, end_date)
+        result = mcp_client.call_tool(
+            "mcp_cash_flow",
+            codes=codes,
+            begin_date=begin_date,
+            end_date=end_date,
+            statement_type=statement_type,
+            report_type=report_type,
+        )
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_profit_express(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+        begin_date: Annotated[str, "报告期起始 yyyy-mm-dd,默认1990"] = None,
+        end_date: Annotated[str, "报告期截止 yyyy-mm-dd"] = None,
+    ) -> str:
+        """星耀数智 MCP 业绩快报:上市公司正式披露前的快报营收/净利/变动幅度等。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        begin_date, end_date = _default_finance_window(begin_date, end_date)
+        result = mcp_client.call_tool(
+            "mcp_profit_express", codes=codes, begin_date=begin_date, end_date=end_date
+        )
+        return mcp_client.format_result(result)
+
+    @staticmethod
+    @tool
+    def mcp_profit_notice(
+        codes: Annotated[str, "股票代码,逗号分隔,必须带交易所后缀,如 000001.SZ,600000.SH"],
+        begin_date: Annotated[str, "报告期起始 yyyy-mm-dd,默认1990"] = None,
+        end_date: Annotated[str, "报告期截止 yyyy-mm-dd"] = None,
+    ) -> str:
+        """星耀数智 MCP 业绩预告:预增/预减/扭亏/续亏/首亏等业绩预告及变动幅度。"""
+        from tradingagents.dataflows.providers.china import mcp_client
+
+        begin_date, end_date = _default_finance_window(begin_date, end_date)
+        result = mcp_client.call_tool(
+            "mcp_profit_notice", codes=codes, begin_date=begin_date, end_date=end_date
+        )
+        return mcp_client.format_result(result)
 
     @staticmethod
     # @tool  # 已移除：请使用 get_stock_fundamentals_unified 或 get_stock_market_data_unified

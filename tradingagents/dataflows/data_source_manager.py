@@ -6,6 +6,7 @@
 
 import os
 import time
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from enum import Enum
 import warnings
@@ -53,6 +54,148 @@ class USDataSource(Enum):
 
 
 
+def _mcp_enabled() -> bool:
+    """AmazingData 正式账号 env 是否齐全。缺则各 _mcp_* 直接返回空(免登录子进程开销,无 AD_* 部署也快)。"""
+    return bool(os.environ.get("AD_USERNAME") and os.environ.get("AD_PASSWORD")
+                and os.environ.get("AD_HOST") and os.environ.get("AD_PORT"))
+
+
+def _num(value):
+    """MCP 报表值(可能是字符串 "1.24"/"None"/None)→ float/None。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.lower() in ("none", "nan", "null"):
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+
+
+
+# MCP 证券基础信息进程级缓存:多分析师同标的并发时只连一次 AmazingData(单账号单连接)
+_MCP_STOCK_INFO_CACHE: Dict[str, Dict] = {}
+
+
+def _mcp_market_code(symbol: str) -> str:
+    """裸 A 股代码 → MCP 用的交易所全码(6→.SH, 0/1/2/3→.SZ, 4/8→.BJ)。
+
+    mcp_stock_basic 服务端只认带后缀全码(实测 000001 失败, 000001.SZ 才返回)。
+    """
+    s = str(symbol).strip().upper()
+    if "." in s:
+        return s
+    if len(s) == 6 and s.isdigit():
+        if s.startswith("6"):
+            return f"{s}.SH"
+        if s.startswith(("0", "2", "3")):
+            return f"{s}.SZ"
+        if s.startswith(("4", "8")):
+            return f"{s}.BJ"
+    return s
+
+
+def _mcp_full_code(symbol: str) -> Optional[str]:
+    """裸 A 股代码 → MCP 全码;非 A 股(港股/美股)返回 None。"""
+    s = _mcp_market_code(str(symbol))
+    if "." in s and len(s.split(".")[0]) == 6:
+        return s
+    return None
+
+
+def _mcp_batch_sections_text(symbol: str, *tool_specs: tuple) -> str:
+    """一个 MCP 会话内依次拉若干事件/股东工具,格式化成 markdown 段落。
+
+    tool_specs 每项为 (tool_name, kwargs, title);单工具失败/超时(15s)/空数据
+    该段静默跳过,不影响其它工具。无 AD_* 环境直接返回 ""(fail-fast,不启子进程)。
+    """
+    if not _mcp_enabled():
+        return ""
+    full = _mcp_full_code(symbol)
+    if not full:
+        return ""
+    import asyncio
+    from tradingagents.dataflows.providers.china import mcp_client
+
+    async def _run() -> str:
+        async with mcp_client.open_session() as mcp:
+            parts: List[str] = []
+            for tool, kw, title in tool_specs:
+                try:
+                    r = await asyncio.wait_for(mcp.call(tool, **kw), timeout=15)
+                except asyncio.TimeoutError:
+                    logger.warning(f"⏱️ MCP {tool} 超时(15s)跳过")
+                    continue
+                except Exception as e:
+                    logger.warning(f"⚠️ MCP {tool} 异常跳过: {str(e)[:120]}")
+                    continue
+                # fastmcp 把工具内异常当正常结果文本返回;或工具返回 {success:False,...}
+                if isinstance(r, dict):
+                    if set(r) == {"raw"}:
+                        raw = str(r.get("raw", ""))
+                    else:
+                        raw = str(r.get("message") or r)
+                    if r.get("success") is False or "error calling tool" in raw.lower() \
+                            or "查询失败" in raw or "traceback" in raw.lower():
+                        logger.warning(f"⚠️ MCP {tool} 返回错误,跳过: {raw[:100]}")
+                        continue
+                txt = mcp_client.format_result(r, max_rows=12)
+                if txt and txt.strip() not in ("", "(空)") and "无数据" not in txt:
+                    parts.append(f"### {title}\n{txt}")
+            return "\n\n".join(parts)
+
+    try:
+        with mcp_client._MCP_LOCK:
+            return asyncio.run(_run())
+    except Exception as e:
+        logger.warning(f"⚠️ MCP 批拉会话异常: {str(e)[:200]}")
+        return ""
+
+
+def mcp_market_event_sections(symbol: str, start_date: str = None, end_date: str = None) -> str:
+    """市场分析师报告附加段(MCP-first):龙虎榜/大宗/业绩快报/预告/股权质押/解禁。
+
+    说明:交易日历工具返回全量历史(8725 行),不适合单标报告,已剔除;
+    行业指数工具属市场级批量数据,平台侧按需调用,不进单标报告。
+    """
+    if not _mcp_enabled():
+        return ""
+    full = _mcp_full_code(symbol)
+    if not full:
+        return ""
+    e = (end_date or datetime.now().strftime("%Y-%m-%d")).replace("-", "")
+    b = (start_date or (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")).replace("-", "")
+    specs = [
+        ("mcp_long_hu_bang", {"code_list": [full], "begin_date": b, "end_date": e}, "龙虎榜资金动向"),
+        ("mcp_block_trading", {"code_list": [full], "begin_date": b, "end_date": e}, "大宗交易"),
+        ("mcp_profit_express", {"code_list": [full], "begin_date": b, "end_date": e}, "业绩快报"),
+        ("mcp_profit_notice", {"code_list": [full], "begin_date": b, "end_date": e}, "业绩预告"),
+        ("mcp_equity_pledge_freeze", {"code_list": [full], "begin_date": b, "end_date": e}, "股权质押与冻结"),
+        ("mcp_equity_restricted", {"code_list": [full], "begin_date": b, "end_date": e}, "限售股解禁"),
+        ("mcp_treasury_yield", {"code_list": ["y10", "y5", "y1"], "begin_date": b, "end_date": e}, "国债收益率(%,市场宏观)"),
+    ]
+    return _mcp_batch_sections_text(symbol, *specs)
+
+
+def mcp_holder_sections(symbol: str) -> str:
+    """基本面报告附加段(MCP-first):股东户数 / 十大股东(近 1 年报告期)。"""
+    if not _mcp_enabled():
+        return ""
+    full = _mcp_full_code(symbol)
+    if not full:
+        return ""
+    e = datetime.now().strftime("%Y-%m-%d").replace("-", "")
+    b = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d").replace("-", "")
+    specs = [
+        ("mcp_holder_num", {"code_list": [full], "begin_date": b, "end_date": e}, "股东户数(近1年)"),
+        ("mcp_share_holder", {"code_list": [full], "begin_date": b, "end_date": e}, "十大股东(近1年)"),
+    ]
+    return _mcp_batch_sections_text(symbol, *specs)
+
 
 class DataSourceManager:
     """数据源管理器"""
@@ -66,7 +209,7 @@ class DataSourceManager:
         self.available_sources = self._check_available_sources()
         self.current_source = self.default_source
 
-        # 初始化统一缓存管理器
+        # 统一缓存管理器
         self.cache_manager = None
         self.cache_enabled = False
         try:
@@ -267,6 +410,11 @@ class DataSourceManager:
         start_time = time.time()
 
         try:
+            # 🔥 MCP 活数据优先(财务三表),失败/空自动回退现有数据链
+            mcp_fund = self._get_mcp_fundamentals(symbol)
+            if mcp_fund:
+                return mcp_fund
+
             # 根据数据源调用相应的获取方法
             if self.current_source == ChinaDataSource.MONGODB:
                 result = self._get_mongodb_fundamentals(symbol)
@@ -351,6 +499,7 @@ class DataSourceManager:
         start_time = time.time()
 
         try:
+            # 新闻:MCP 暂无工具,直接走现有数据源链(finnhub/google/reddit 保留)
             # 根据数据源调用相应的获取方法
             if self.current_source == ChinaDataSource.MONGODB:
                 result = self._get_mongodb_news(symbol, hours_back, limit)
@@ -924,6 +1073,12 @@ class DataSourceManager:
         logger.info(f"📊 [DataFrame接口] 获取股票数据: {symbol} ({start_date} 到 {end_date})")
 
         try:
+            # 🔥 MCP 活数据优先(仅 daily),失败/空自动回退现有数据链
+            mcp_df = self._mcp_kline_df(symbol, start_date, end_date, period)
+            if mcp_df is not None:
+                logger.info(f"✅ [MCP] DataFrame 直取成功: {symbol} ({len(mcp_df)}条)")
+                return self._standardize_dataframe(mcp_df)
+
             # 尝试当前数据源
             df = None
             if self.current_source == ChinaDataSource.MONGODB:
@@ -1028,6 +1183,256 @@ class DataSourceManager:
 
         return out
 
+    # ==================== MCP 活数据短路 ====================
+
+    def _mcp_kline_df(self, symbol: str, start_date: str, end_date: str, period: str = "daily"):
+        """MCP 活数据 -> 日线标准列 df;仅 daily 走 MCP,失败/空返回 None 由上层走现有链。
+
+        注:不复权真实价(对齐原 zvt hfq=False 口径);如需前复权再经 technical.forward_adjust。
+        """
+        if not _mcp_enabled() or period != "daily":
+            return None
+        try:
+            from tradingagents.dataflows.providers.china import mcp_client
+            if not start_date:
+                start_date = (datetime.now() - timedelta(days=2 * 365.24)).strftime("%Y-%m-%d")
+            if not end_date:
+                end_date = datetime.now().strftime("%Y-%m-%d")
+            res = mcp_client.call_tool("mcp_kline", codes=symbol, begin_date=start_date,
+                                       end_date=end_date, period="day")
+            data = (res or {}).get("data", {}) if isinstance(res, dict) else {}
+            if not isinstance(data, dict) or not data:
+                return None
+            rows = next(iter(data.values()))  # 单标的查询,取其一个 key 的 K线
+            if not rows or not isinstance(rows, list):
+                return None
+            recs = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                recs.append({
+                    "date": pd.to_datetime(r.get("kline_time")),
+                    "open": r.get("open"), "high": r.get("high"), "low": r.get("low"),
+                    "close": r.get("close"), "vol": r.get("volume"), "amount": r.get("amount"),
+                })
+            df = pd.DataFrame(recs).dropna(subset=["date"])
+            if df.empty:
+                return None
+            df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+            logger.info(f"✅ [MCP] {symbol} 日线获取成功: {len(df)}条")
+            return df
+        except Exception as e:
+            logger.warning(f"⚠️ [MCP] {symbol} 日线短路失败: {e}")
+        return None
+
+    def _get_mcp_kline_text(self, symbol: str, start_date: str, end_date: str, period: str = "daily"):
+        """MCP 日线 -> 统一技术分析文本;成功返回文本,否则 None(走现有链)。"""
+        df = self._mcp_kline_df(symbol, start_date, end_date, period)
+        if df is None or df.empty:
+            return None
+        try:
+            result = self._format_stock_data_response(df, symbol, f"股票{symbol}", start_date, end_date)
+            if result and "❌" not in result:
+                logger.info(f"✅ [数据来源: MCP] 成功获取股票数据: {symbol}")
+                return result
+            return None
+        except Exception as e:
+            logger.warning(f"⚠️ [MCP] {symbol} 格式化日线失败: {e}")
+            return None
+
+    def _get_mcp_fundamentals(self, symbol: str):
+        """MCP 三表 -> 基本面报告文本(4.2 财务 schema 映射:AmazingData 报表字段 → canonical);
+        成功返回报告文本,否则 None(走现有链)。"""
+        if not _mcp_enabled():
+            return None
+        try:
+            import asyncio
+
+            from tradingagents.dataflows.providers.china import mcp_client
+            from tradingagents.dataflows.providers.china.valuation import _norm_code, _pull_records
+
+            code = _norm_code(symbol)
+            fin_begin, fin_end = "20240101", "20300101"  # 近若干季,供多期对照
+
+            async def _run():
+                async with mcp_client.open_session() as mcp:
+                    inc = await mcp_client.get_income(mcp, [code], fin_begin, fin_end, statement_type="1")
+                    bs = await mcp_client.get_balance_sheet(mcp, [code], fin_begin, fin_end, statement_type="1")
+                    cf = await mcp_client.get_cash_flow(mcp, [code], fin_begin, fin_end, statement_type="1")
+                    return inc, bs, cf
+
+            with mcp_client._MCP_LOCK:
+                inc_res, bs_res, cf_res = asyncio.run(_run())
+
+            def by_period(recs):
+                out = {}
+                for r in recs or []:
+                    rp = r.get("REPORTING_PERIOD")
+                    if rp:
+                        out[str(rp)] = r
+                return out
+
+            inc_map = by_period(_pull_records(inc_res, code))
+            bs_map = by_period(_pull_records(bs_res, code))
+            cf_map = by_period(_pull_records(cf_res, code))
+            periods = sorted(set(inc_map) | set(bs_map) | set(cf_map), reverse=True)
+            canonical = []
+            for rp in periods:
+                b, i, c = bs_map.get(rp, {}), inc_map.get(rp, {}), cf_map.get(rp, {})
+                op_income = _num(i.get("OPERA_REV")) or _num(i.get("TOT_OPERA_REV"))
+                np_ = _num(i.get("NET_PRO_EXCL_MIN_INT_INC")) or _num(i.get("NET_PRO_INCL_MIN_INT_INC"))
+                total_assets = _num(b.get("TOTAL_ASSETS"))
+                equity = _num(b.get("TOT_SHARE_EQUITY_EXCL_MIN_INT")) or _num(b.get("TOT_SHARE_EQUITY_INCL_MIN_INT"))
+                op_cost = _num(i.get("LESS_OPERA_COST"))
+                row = {
+                    "report_period": rp,
+                    "end_date": rp,
+                    "revenue": op_income,
+                    "total_revenue": op_income,
+                    "net_profit": np_,
+                    "net_income": np_,
+                    "eps": _num(i.get("BASIC_EPS")) or _num(i.get("DILUTED_EPS")),
+                    "total_assets": total_assets,
+                    "total_liab": _num(b.get("TOTAL_LIAB")),
+                    "total_equity": equity,
+                    "n_cashflow_act": _num(c.get("NET_CASH_FLOWS_OPERA_ACT")),
+                    "n_cashflow_inv_act": _num(c.get("NET_CASH_FLOWS_INV_ACT")),
+                    "n_cashflow_fin_act": _num(c.get("NET_CASH_FLOWS_FIN_ACT")),
+                    "c_cash_equ_end_period": _num(c.get("END_BAL_CASH_CASH_EQU")) or _num(c.get("CASH_END_BAL")),
+                    "roe": (np_ / equity * 100) if np_ is not None and equity else None,
+                    "roa": (np_ / total_assets * 100) if np_ is not None and total_assets else None,
+                    "gross_margin": ((op_income - op_cost) / op_income * 100)
+                    if op_income and op_cost is not None else None,
+                    "netprofit_margin": (np_ / op_income * 100) if np_ is not None and op_income else None,
+                    "source": "MCP",
+                }
+                canonical.append(row)
+            if not canonical:
+                return None
+            result = self._format_financial_data(symbol, canonical, source="MCP")
+            if result and "❌" not in result:
+                logger.info(f"✅ [数据来源: MCP] 成功获取基本面数据: {symbol} ({len(canonical)}期)")
+                return result
+            return None
+        except Exception as e:
+            logger.warning(f"⚠️ [MCP] {symbol} 基本面短路失败: {e}")
+            return None
+
+    def _mcp_market_cap(self, symbol: str):
+        """最新股本×最新 close → (total_mv 亿元, circ_mv 亿元);失败返回 None。股本单位=万股。"""
+        if not _mcp_enabled():
+            return None
+        try:
+            import asyncio
+
+            from tradingagents.dataflows.providers.china import mcp_client
+            from tradingagents.dataflows.providers.china.valuation import _norm_code, _pull_records
+
+            code = _norm_code(symbol)
+            now = datetime.now()
+            kl_end = now.strftime("%Y%m%d")
+            kl_begin = (now - timedelta(days=15)).strftime("%Y%m%d")
+            eq_begin = (now - timedelta(days=400)).strftime("%Y%m%d")  # 覆盖最近股本变动
+
+            async def _run():
+                async with mcp_client.open_session() as mcp:
+                    kl = await mcp_client.get_kline(mcp, [code], kl_begin, kl_end, period="day")
+                    eq = await mcp_client.get_equity_structure(mcp, [code], eq_begin, kl_end)
+                    return kl, eq
+
+            with mcp_client._MCP_LOCK:
+                kl_res, eq_res = asyncio.run(_run())
+            krows = _pull_records(kl_res, code)
+            if not krows:
+                return None
+            latest = max((r for r in krows if r.get("kline_time")), key=lambda r: r["kline_time"])
+            close = _num(latest.get("close"))
+            eq_rows = _pull_records(eq_res, code)
+            tot_share = circ_share = None
+            if eq_rows:
+                r = eq_rows[-1]
+                tot_share = _num(r.get("TOT_SHARE")) or _num(r.get("FLOAT_SHARE"))
+                circ_share = _num(r.get("FLOAT_SHARE"))
+            if close is None or tot_share is None:
+                return None
+            # total_mv(亿)=close元×万股×1e4股 / 1e8 = close×万股/1e4
+            total_mv = round(close * tot_share / 1e4, 2)
+            circ_mv = round(close * circ_share / 1e4, 2) if circ_share else None
+            return total_mv, circ_mv
+        except Exception as e:
+            logger.warning(f"⚠️ [MCP] {symbol} 市值获取失败: {e}")
+            return None
+
+    def _get_mcp_valuation_indicators(self, symbol: str) -> Dict:
+        """MCP 估值指标(pe/pb/pe_ttm/ps + 市值,unit=亿元);失败/不可用返回 {} 走 mongodb 兜底。"""
+        if not _mcp_enabled():
+            return {}
+        try:
+            from tradingagents.dataflows.providers.china.valuation import compute_valuation
+            now = datetime.now()
+            end = now.strftime("%Y-%m-%d")
+            begin = (now - timedelta(days=int(3 * 365.24 * 1.2))).strftime("%Y-%m-%d")
+            df = compute_valuation(symbol, begin, end)
+            if df is None or df.empty:
+                return {}
+
+            def g(col):
+                v = df[col].iloc[-1] if col in df.columns else None
+                return None if v is None or pd.isna(v) else round(float(v), 4)
+
+            mv = self._mcp_market_cap(symbol)
+            out = {
+                "pe": g("市盈率"),
+                "pb": g("市净率"),
+                "pe_ttm": g("市盈率TTM"),
+                "ps": g("市销率"),
+                "total_mv": mv[0] if mv else None,
+                "circ_mv": mv[1] if mv else None,
+                "source": "MCP",
+            }
+            logger.info(f"✅ [MCP] {symbol} 估值指标获取成功: pe_ttm={out['pe_ttm']}, pb={out['pb']}, mv={out['total_mv']}")
+            return out
+        except Exception as e:
+            logger.warning(f"⚠️ [MCP] {symbol} 估值指标获取失败: {e}")
+            return {}
+
+    def _get_mcp_stock_info(self, symbol: str) -> Dict:
+        """MCP 证券基础信息(证券简称/中文名/上市板块/上市日期)。
+
+        MCP-first 与阶段4 同向:缺 AD_* 或失败返回 {} → get_stock_info 走现有兜底链。
+        进程级按 symbol 缓存,多分析师并发同名标的只连一次 AmazingData(单账号单连接)。
+        """
+        if not _mcp_enabled():
+            return {}
+        cached = _MCP_STOCK_INFO_CACHE.get(symbol)
+        if cached:
+            return cached
+        try:
+            from tradingagents.dataflows.providers.china import mcp_client
+            resp = mcp_client.call_tool("mcp_stock_basic", codes=_mcp_market_code(symbol))
+            data = (resp or {}).get("data") if isinstance(resp, dict) else []
+            if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+                return {}
+            row = data[0]
+            name = (row.get("SECURITY_NAME") or row.get("COMP_NAME") or "").strip()
+            if not name:
+                return {}
+            info = {
+                "symbol": symbol,
+                "name": name,
+                "area": "未知",
+                "industry": "未知",
+                "market": row.get("LISTPLATE_NAME") or "未知",
+                "list_date": str(row.get("LISTDATE") or "未知"),
+                "source": "MCP",
+            }
+            _MCP_STOCK_INFO_CACHE[symbol] = info
+            logger.info(f"✅ [MCP-stock_basic] {symbol} -> {name}")
+            return info
+        except Exception as e:
+            logger.warning(f"⚠️ [MCP] {symbol} 证券基础信息获取失败: {e}")
+            return {}
+
     def get_stock_data(self, symbol: str, start_date: str = None, end_date: str = None, period: str = "daily") -> str:
         """
         获取股票数据的统一接口，支持多周期数据
@@ -1061,6 +1466,11 @@ class DataSourceManager:
         start_time = time.time()
 
         try:
+            # 🔥 MCP 活数据优先(仅 daily),失败/空自动回退现有数据链
+            mcp_result = self._get_mcp_kline_text(symbol, start_date, end_date, period)
+            if mcp_result:
+                return mcp_result
+
             # 根据数据源调用相应的获取方法
             actual_source = None  # 实际使用的数据源
 
@@ -1500,6 +1910,11 @@ class DataSourceManager:
                 logger.error(f"❌ [数据来源: MongoDB异常] 获取股票信息失败: {e}", exc_info=True)
 
 
+        # 🔥 MCP 证券基础信息优先(公司名/板块/上市日期);失败/空 → 现有链兜底
+        mcp_info = self._get_mcp_stock_info(symbol)
+        if mcp_info and mcp_info.get('name') and mcp_info['name'] != f'股票{symbol}':
+            return mcp_info
+
         # 首先尝试当前数据源
         try:
             if self.current_source == ChinaDataSource.TUSHARE:
@@ -1710,6 +2125,12 @@ class DataSourceManager:
         try:
             import baostock as bs
 
+            # baostock 的 default_socket 创建时无超时:socketutil.send_msg 的 recv 死循环
+            # 无任何超时保护,远端半死连接(不回应也未发 FIN)会让 recv 永久阻塞 → 整条
+            # LangGraph 线程池随之卡死。登录前设进程内默认超时,登录后再加固实际 socket。
+            import socket as _socket
+            _socket.setdefaulttimeout(15)
+
             # 转换股票代码格式
             if symbol.startswith('6'):
                 bs_code = f"sh.{symbol}"
@@ -1721,6 +2142,12 @@ class DataSourceManager:
             if lg.error_code != '0':
                 logger.error(f"❌ [股票信息] BaoStock登录失败: {lg.error_msg}")
                 return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'baostock'}
+
+            # 登录后对底层 socket 直接设超时(baostock 全局单例连接,跨调用复用,需每处持久生效)
+            import baostock.common.context as _bs_context
+            _bs_sock = getattr(_bs_context, "default_socket", None)
+            if _bs_sock is not None:
+                _bs_sock.settimeout(15)
 
             # 查询股票基本信息
             rs = bs.query_stock_basic(code=bs_code)
@@ -1852,7 +2279,16 @@ class DataSourceManager:
             return f"❌ 生成{symbol}基本面分析失败: {e}"
 
     def _get_valuation_indicators(self, symbol: str) -> Dict:
-        """从stock_basic_info集合获取估值指标"""
+        """获取估值指标。MCP 优先(pe/pb/ps/市值,unit=亿元),缺失走 mongodb stock_basic_info"""
+        # 🔥 MCP 估值优先(失败/空走 mongodb 兜底)
+        try:
+            mcp_val = self._get_mcp_valuation_indicators(symbol)
+            if mcp_val:
+                return mcp_val
+        except Exception as e:
+            logger.warning(f"⚠️ [MCP] {symbol} 估值短路失败: {e}")
+
+        # 兜底:mongodb stock_basic_info
         try:
             db_manager = get_database_manager()
             if not db_manager.is_mongodb_available():
@@ -1879,7 +2315,7 @@ class DataSourceManager:
             logger.error(f"获取{symbol}估值指标失败: {e}")
             return {}
 
-    def _format_financial_data(self, symbol: str, financial_data: List[Dict]) -> str:
+    def _format_financial_data(self, symbol: str, financial_data: List[Dict], source: str = "MongoDB") -> str:
         """格式化财务数据为报告"""
         try:
             if not financial_data or len(financial_data) == 0:
@@ -1889,11 +2325,11 @@ class DataSourceManager:
             latest = financial_data[0]
 
             # 构建报告
-            report = f"📊 {symbol} 基本面数据（来自MongoDB）\n\n"
+            report = f"📊 {symbol} 基本面数据（来自{source}）\n\n"
 
             # 基本信息
             report += f"📅 报告期: {latest.get('report_period', latest.get('end_date', '未知'))}\n"
-            report += f"📈 数据来源: MongoDB财务数据库\n\n"
+            report += f"📈 数据来源: {source}\n\n"
 
             # 财务指标
             report += "💰 财务指标:\n"
@@ -2172,6 +2608,14 @@ def get_china_stock_data_unified(symbol: str, start_date: str, end_date: str) ->
             logger.info(f"🔍 [股票代码追踪] 数据行示例: 第1行='{data_lines[0][:100]}', 最后1行='{data_lines[-1][:100]}'")
     else:
         logger.info(f"🔍 [股票代码追踪] 返回结果: None")
+
+    # 阶段5「全部接」:追加 MCP 事件段(龙虎榜/大宗/业绩/质押解禁/日历),失败静默不影响主文本
+    try:
+        event_section = mcp_market_event_sections(symbol, start_date, end_date)
+        if event_section:
+            result = f"{result}\n\n## 🧾 市场事件数据(AmazingData MCP)\n{event_section}"
+    except Exception as e:
+        logger.warning(f"⚠️ MCP 事件段生成失败(忽略): {e}")
     return result
 
 

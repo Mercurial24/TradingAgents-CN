@@ -458,6 +458,14 @@ class OptimizedChinaDataProvider:
 **生成时间**: {datetime.now(ZoneInfo(get_timezone_name())).strftime('%Y-%m-%d %H:%M:%S')}
 **数据来源**: 基础市场数据
 """
+            # 阶段5「全部接」:即使旧链 (Mongo/AKShare/Tushare) 财务拉取失败,仍追加 MCP 股东段补足
+            try:
+                from .data_source_manager import mcp_holder_sections
+                holder_section = mcp_holder_sections(symbol)
+                if holder_section:
+                    simplified_report = f"{simplified_report}\n\n## 🧾 股东结构数据(AmazingData MCP)\n{holder_section}"
+            except Exception as e:
+                logger.warning(f"⚠️ MCP 股东段生成失败(忽略): {e}")
             return simplified_report.strip()
 
         logger.debug(f"🔍 [股票代码追踪] 开始生成报告，使用股票代码: '{symbol}'")
@@ -496,7 +504,7 @@ class OptimizedChinaDataProvider:
 - **市净率(PB)**: {financial_estimates.get('pb', 'N/A')}
 - **净资产收益率(ROE)**: {financial_estimates.get('roe', 'N/A')}
 - **资产负债率**: {financial_estimates.get('debt_ratio', 'N/A')}
-
+{financial_estimates.get('valuation_percentile_note', '')}
 ## 💡 基础评估
 - **基本面评分**: {financial_estimates['fundamental_score']}/10
 - **风险等级**: {financial_estimates['risk_level']}
@@ -529,7 +537,7 @@ class OptimizedChinaDataProvider:
 - **市净率(PB)**: {financial_estimates.get('pb', 'N/A')}
 - **市销率(PS)**: {financial_estimates.get('ps', 'N/A')}
 - **股息收益率**: {financial_estimates.get('dividend_yield', 'N/A')}
-
+{financial_estimates.get('valuation_percentile_note', '')}
 ### 盈利能力指标
 - **净资产收益率(ROE)**: {financial_estimates['roe']}
 - **总资产收益率(ROA)**: {financial_estimates['roa']}
@@ -588,7 +596,7 @@ class OptimizedChinaDataProvider:
 - **市净率(PB)**: {financial_estimates.get('pb', 'N/A')}
 - **市销率(PS)**: {financial_estimates.get('ps', 'N/A')}
 - **股息收益率**: {financial_estimates.get('dividend_yield', 'N/A')}
-
+{financial_estimates.get('valuation_percentile_note', '')}
 ### 盈利能力指标
 - **净资产收益率(ROE)**: {financial_estimates.get('roe', 'N/A')}
 - **总资产收益率(ROA)**: {financial_estimates.get('roa', 'N/A')}
@@ -675,6 +683,15 @@ class OptimizedChinaDataProvider:
 **数据来源**: {data_source if data_source else "多源数据"}数据接口 + 基本面分析模型
 **生成时间**: {datetime.now(ZoneInfo(get_timezone_name())).strftime('%Y-%m-%d %H:%M:%S')}
 """
+
+        # 阶段5「全部接」:追加 MCP 股东段(股东户数/十大股东),失败/空静默不影响主报告
+        try:
+            from .data_source_manager import mcp_holder_sections
+            holder_section = mcp_holder_sections(symbol)
+            if holder_section:
+                report = f"{report}\n\n## 🧾 股东结构数据(AmazingData MCP)\n{holder_section}"
+        except Exception as e:
+            logger.warning(f"⚠️ MCP 股东段生成失败(忽略): {e}")
 
         return report
 
@@ -821,6 +838,34 @@ class OptimizedChinaDataProvider:
             }
         }
 
+    def _get_valuation_percentile_note(self, symbol: str) -> str:
+        """取估值历史分位整行文本(pe/pe_ttm/pb 相对自身近N年),失败/不可用返回空串(整行不渲染)。
+
+        阶段3:MCP 现算分位(不复权 close+TTM 净利润,pit 前向填充;rolling 1095D/min=250
+        apply 窗口内<=当前值占比),口径对齐 zvt ValuationPercentileFactor,脱离 zvt(D9)。
+        """
+        try:
+            from tradingagents.dataflows.providers.china.valuation import compute_valuation_percentile  # noqa: PLC0415
+
+            today = datetime.now()
+            end = today.date().isoformat()
+            begin = (today - timedelta(days=int(3 * 365.24 * 1.2))).date().isoformat()
+            pct = compute_valuation_percentile(symbol, begin, end, years=3)
+            cols = pct.get("columns", {})
+            if not cols:
+                return ""
+            parts = []
+            for label, col in (("PE", "市盈率"), ("PE_TTM", "市盈率TTM"), ("PB", "市净率")):
+                p = cols.get(col, {}).get("percentile")
+                if p is not None:
+                    parts.append(f"{label}={p:.1f}%")
+            if not parts:
+                return ""
+            return f"- **估值历史分位**（近{pct.get('years', 3)}年自身历史分位: {', '.join(parts)}，数值越低越便宜）"
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"⚠️ [估值] 分位注记生成失败: {e}")
+            return ""
+
     def _estimate_financial_metrics(self, symbol: str, current_price: str) -> dict:
         """获取真实财务指标（从 MongoDB、AKShare、Tushare 获取，失败则抛出异常）"""
 
@@ -834,6 +879,7 @@ class OptimizedChinaDataProvider:
         real_metrics = self._get_real_financial_metrics(symbol, price_value)
         if real_metrics:
             logger.info(f"✅ 使用真实财务数据: {symbol}")
+            real_metrics["valuation_percentile_note"] = self._get_valuation_percentile_note(symbol)
             return real_metrics
 
         # 如果无法获取真实数据，抛出异常
