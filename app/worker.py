@@ -89,6 +89,26 @@ async def process_task(task_id: str) -> None:
         market_type = params.get("market_type", "美股")
         analysis_date = params.get("analysis_date", datetime.now().strftime("%Y-%m-%d"))
 
+        # 🔧 与 FastAPI /single 路径对齐:quick/deep 走 DB 模型目录(支持混合厂家)
+        # 任务显式传入 quick/deep 时优先;否则按研究深度由模型目录自动推荐,不再走 analysis_runner 的 legacy 矩阵
+        def resolve_quick_deep():
+            from app.services.model_capability_service import get_model_capability_service
+            quick = params.get("quick_model") or params.get("quick_analysis_model")
+            deep = params.get("deep_model") or params.get("deep_analysis_model")
+            if quick and deep:
+                return quick, deep
+            numeric_to_chinese = {1: "快速", 2: "基础", 3: "标准", 4: "深度", 5: "全面"}
+            if isinstance(research_depth, (int, float)) and int(research_depth) in numeric_to_chinese:
+                depth_label = numeric_to_chinese[int(research_depth)]
+            elif research_depth in numeric_to_chinese.values():
+                depth_label = research_depth
+            else:
+                depth_label = "标准"
+            return get_model_capability_service().recommend_models_for_depth(depth_label)
+
+        quick_model, deep_model = resolve_quick_deep()
+        logger.info(f"🔧 [worker] DB驱动模型: quick={quick_model}, deep={deep_model}")
+
         # Progress callback function
         async def progress_callback(message: str, step: Optional[int] = None, total_steps: Optional[int] = None):
             await publish_progress(task_id, message, step, total_steps)
@@ -117,6 +137,8 @@ async def process_task(task_id: str) -> None:
                     llm_model=llm_model,
                     market_type=market_type,
                     progress_callback=safe_progress,
+                    quick_model=quick_model,
+                    deep_model=deep_model,
                 )
 
             # Run analysis in thread pool to avoid blocking
