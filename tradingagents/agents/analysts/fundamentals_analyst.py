@@ -16,6 +16,7 @@ logger = get_logger("default")
 # 导入Google工具调用处理器
 from tradingagents.agents.utils.google_tool_handler import GoogleToolCallHandler
 from tradingagents.agents.utils.instrument_utils import build_instrument_context
+from tradingagents.config.prompt_manager import get_prompt
 from tradingagents.llm_clients import create_llm_client
 
 
@@ -104,7 +105,7 @@ def create_fundamentals_analyst(llm, toolkit):
 
         # 🔧 工具调用计数器 - 防止无限循环
         # 检查消息历史中是否有 ToolMessage，如果有则说明工具已执行过
-        messages = state.get("messages", [])
+        messages = state.get("fundamentals_messages", [])
         tool_message_count = sum(1 for msg in messages if isinstance(msg, ToolMessage))
 
         tool_call_count = state.get("fundamentals_tool_call_count", 0)
@@ -178,62 +179,25 @@ def create_fundamentals_analyst(llm, toolkit):
         logger.info(f"📊 [基本面分析师] 绑定的工具: {tool_names_debug}")
         logger.info(f"📊 [基本面分析师] 目标市场: {market_info['market_name']}")
 
-        # 统一的系统提示，适用于所有股票类型
-        system_message = (
-            f"你是一位专业的股票基本面分析师。"
-            f"⚠️ 绝对强制要求：你必须调用工具获取真实数据！不允许任何假设或编造！"
-            f"任务：分析{company_name}（股票代码：{ticker}，{market_info['market_name']}）"
-            f"{instrument_context}"
-            f"🔴 立即调用 get_stock_fundamentals_unified 工具"
-            f"参数：ticker='{ticker}', start_date='{start_date}', end_date='{current_date}', curr_date='{current_date}'"
-            "📊 分析要求："
-            "- 基于真实数据进行深度基本面分析"
-            f"- 计算并提供合理价位区间（使用{market_info['currency_name']}{market_info['currency_symbol']}）"
-            "- 分析当前股价是否被低估或高估"
-            "- 提供基于基本面的目标价位建议"
-            "- 包含PE、PB、PEG等估值指标分析"
-            "- 结合市场特点进行分析"
-            "🌍 语言和货币要求："
-            "- 所有分析内容必须使用中文"
-            "- 投资建议必须使用中文：买入、持有、卖出"
-            "- 绝对不允许使用英文：buy、hold、sell"
-            f"- 货币单位使用：{market_info['currency_name']}（{market_info['currency_symbol']}）"
-            "🚫 严格禁止："
-            "- 不允许说'我将调用工具'"
-            "- 不允许假设任何数据"
-            "- 不允许编造公司信息"
-            "- 不允许直接回答而不调用工具"
-            "- 不允许回复'无法确定价位'或'需要更多信息'"
-            "- 不允许使用英文投资建议（buy/hold/sell）"
-            "✅ 你必须："
-            "- 立即调用统一基本面分析工具"
-            "- 等待工具返回真实数据"
-            "- 基于真实数据进行分析"
-            "- 提供具体的价位区间和目标价"
-            "- 使用中文投资建议（买入/持有/卖出）"
-            "现在立即开始调用工具！不要说任何其他话！"
+        # 统一的系统提示，适用于所有股票类型（模板见 prompts/analysts/fundamentals.yaml）
+        system_message = get_prompt(
+            "analysts/fundamentals",
+            "system_message",
+            company_name=company_name,
+            ticker=ticker,
+            market_name=market_info["market_name"],
+            instrument_context=instrument_context,
+            start_date=start_date,
+            current_date=current_date,
+            currency_name=market_info["currency_name"],
+            currency_symbol=market_info["currency_symbol"],
         )
 
-        # 系统提示模板
-        system_prompt = (
-            "🔴 强制要求：你必须调用工具获取真实数据！"
-            "🚫 绝对禁止：不允许假设、编造或直接回答任何问题！"
-            "✅ 工作流程："
-            "1. 【第一次调用】如果消息历史中没有工具结果（ToolMessage），立即调用 get_stock_fundamentals_unified 工具"
-            "2. 【收到数据后】如果消息历史中已经有工具结果（ToolMessage），🚨 绝对禁止再次调用工具！🚨"
-            "3. 【生成报告】收到工具数据后，必须立即生成完整的基本面分析报告，包含："
-            f"4. 【股票代码约束】{instrument_context}"
-            "   - 公司基本信息和财务数据分析"
-            "   - PE、PB、PEG等估值指标分析"
-            "   - 当前股价是否被低估或高估的判断"
-            "   - 合理价位区间和目标价位建议"
-            "   - 基于基本面的投资建议（买入/持有/卖出）"
-            "4. 🚨 重要：工具只需调用一次！一次调用返回所有需要的数据！不要重复调用！🚨"
-            "5. 🚨 如果你已经看到ToolMessage，说明工具已经返回数据，直接生成报告，不要再调用工具！🚨"
-            "可用工具：{tool_names}。\n{system_message}"
-            "当前日期：{current_date}。"
-            "分析目标：{company_name}（股票代码：{ticker}）。"
-            "请确保在分析中正确区分公司名称和股票代码。"
+        # 系统提示模板（保留 {tool_names}/{system_message} 等占位符给 ChatPromptTemplate）
+        system_prompt = get_prompt(
+            "analysts/fundamentals",
+            "system_prompt",
+            instrument_context=instrument_context,
         )
 
         # 创建提示模板
@@ -303,7 +267,7 @@ def create_fundamentals_analyst(llm, toolkit):
         # 添加详细日志
         logger.info(f"📊 [基本面分析师] LLM类型: {fresh_llm.__class__.__name__}")
         logger.info(f"📊 [基本面分析师] LLM模型: {getattr(fresh_llm, 'model_name', 'unknown')}")
-        logger.info(f"📊 [基本面分析师] 消息历史数量: {len(state['messages'])}")
+        logger.info(f"📊 [基本面分析师] 消息历史数量: {len(state['fundamentals_messages'])}")
 
         try:
             chain = prompt | fresh_llm.bind_tools(tools)
@@ -316,7 +280,7 @@ def create_fundamentals_analyst(llm, toolkit):
 
         # 添加详细的股票代码追踪日志
         logger.info(f"🔍 [股票代码追踪] LLM调用前，ticker参数: '{ticker}'")
-        logger.info(f"🔍 [股票代码追踪] 传递给LLM的消息数量: {len(state['messages'])}")
+        logger.info(f"🔍 [股票代码追踪] 传递给LLM的消息数量: {len(state['fundamentals_messages'])}")
 
         # 🔥 打印提交给大模型的完整内容
         logger.info("=" * 80)
@@ -341,7 +305,7 @@ def create_fundamentals_analyst(llm, toolkit):
         # 3. 打印消息历史
         logger.info("📋 [提示词调试] 3️⃣ 消息历史 (Message History):")
         logger.info("-" * 80)
-        for i, msg in enumerate(state['messages']):
+        for i, msg in enumerate(state['fundamentals_messages']):
             msg_type = type(msg).__name__
             if hasattr(msg, 'content'):
                 # 🔥 调试模式：打印完整内容，不截断
@@ -374,7 +338,7 @@ def create_fundamentals_analyst(llm, toolkit):
         logger.info("=" * 80)
 
         # 修复：传递字典而不是直接传递消息列表，以便 ChatPromptTemplate 能正确处理所有变量
-        result = chain.invoke({"messages": state["messages"]})
+        result = chain.invoke({"messages": state["fundamentals_messages"]})
         logger.info(f"📊 [基本面分析师] LLM调用完成")
         
         # 🔍 [调试日志] 打印AIMessage的详细内容
@@ -431,7 +395,8 @@ def create_fundamentals_analyst(llm, toolkit):
                 tools=tools,
                 state=state,
                 analysis_prompt_template=analysis_prompt_template,
-                analyst_name="基本面分析师"
+                analyst_name="基本面分析师",
+                messages_key="fundamentals_messages",
             )
 
             return {"fundamentals_report": report}
@@ -446,7 +411,7 @@ def create_fundamentals_analyst(llm, toolkit):
 
             if current_tool_calls > 0:
                 # 🔧 检查是否已经调用过工具（消息历史中有 ToolMessage）
-                messages = state.get("messages", [])
+                messages = state.get("fundamentals_messages", [])
                 has_tool_result = any(isinstance(msg, ToolMessage) for msg in messages)
 
                 if has_tool_result:
@@ -454,21 +419,11 @@ def create_fundamentals_analyst(llm, toolkit):
                     logger.warning(f"⚠️ [强制生成报告] 工具已返回数据，但LLM仍尝试调用工具，强制基于现有数据生成报告")
 
                     # 创建专门的强制报告提示词（不提及工具）
-                    force_system_prompt = (
-                        f"你是专业的股票基本面分析师。"
-                        f"你已经收到了股票 {company_name}（代码：{ticker}）的基本面数据。"
-                        f"🚨 现在你必须基于这些数据生成完整的基本面分析报告！🚨\n\n"
-                        f"报告必须包含以下内容：\n"
-                        f"1. 公司基本信息和财务数据分析\n"
-                        f"2. PE、PB、PEG等估值指标分析\n"
-                        f"3. 当前股价是否被低估或高估的判断\n"
-                        f"4. 合理价位区间和目标价位建议\n"
-                        f"5. 基于基本面的投资建议（买入/持有/卖出）\n\n"
-                        f"要求：\n"
-                        f"- 使用中文撰写报告\n"
-                        f"- 基于消息历史中的真实数据进行分析\n"
-                        f"- 分析要详细且专业\n"
-                        f"- 投资建议必须明确（买入/持有/卖出）"
+                    force_system_prompt = get_prompt(
+                        "analysts/fundamentals",
+                        "force_system_prompt",
+                        company_name=company_name,
+                        ticker=ticker,
                     )
 
                     # 创建专门的提示模板（不绑定工具）
@@ -488,7 +443,7 @@ def create_fundamentals_analyst(llm, toolkit):
 
                     return {
                         "fundamentals_report": report,
-                        "messages": [force_result],
+                        "fundamentals_messages": [force_result],
                         "fundamentals_tool_call_count": tool_call_count
                     }
 
@@ -497,7 +452,7 @@ def create_fundamentals_analyst(llm, toolkit):
                     logger.warning(f"🔧 [异常情况] 达到最大工具调用次数 {max_tool_calls}，但没有工具结果")
                     fallback_report = f"基本面分析（股票代码：{ticker}）\n\n由于达到最大工具调用次数限制，使用简化分析模式。建议检查数据源连接或降低分析复杂度。"
                     return {
-                        "messages": [result],
+                        "fundamentals_messages": [result],
                         "fundamentals_report": fallback_report,
                         "fundamentals_tool_call_count": tool_call_count
                     }
@@ -515,7 +470,7 @@ def create_fundamentals_analyst(llm, toolkit):
                     # ⚠️ 注意：不要在这里增加计数器！
                     # 计数器应该在工具执行完成后（下一次进入分析师节点时）才增加
                     return {
-                        "messages": [result]
+                        "fundamentals_messages": [result]
                     }
             else:
                 # 没有工具调用，检查是否需要强制调用工具
@@ -523,7 +478,7 @@ def create_fundamentals_analyst(llm, toolkit):
                 logger.debug(f"📊 [DEBUG] 检测到模型未调用工具，检查是否需要强制调用")
 
                 # 方案1：检查消息历史中是否已经有工具返回的数据
-                messages = state.get("messages", [])
+                messages = state.get("fundamentals_messages", [])
                 logger.info(f"🔍 [消息历史] 当前消息总数: {len(messages)}")
 
                 # 统计各类消息数量
@@ -576,7 +531,7 @@ def create_fundamentals_analyst(llm, toolkit):
                     # 🔧 保持工具调用计数器不变（已在开始时根据ToolMessage更新）
                     return {
                         "fundamentals_report": report,
-                        "messages": [result],
+                        "fundamentals_messages": [result],
                         "fundamentals_tool_call_count": tool_call_count
                     }
 
@@ -641,28 +596,19 @@ def create_fundamentals_analyst(llm, toolkit):
                 currency_info = f"{market_info['currency_name']}（{market_info['currency_symbol']}）"
                 
                 # 生成基于真实数据的分析报告
-                analysis_prompt = f"""基于以下真实数据，对{company_name}（股票代码：{ticker}）进行详细的基本面分析：
-
-{combined_data}
-
-请提供：
-1. 公司基本信息分析（{company_name}，股票代码：{ticker}）
-2. 财务状况评估
-3. 盈利能力分析
-4. 估值分析（使用{currency_info}）
-5. 投资建议（买入/持有/卖出）
-
-要求：
-- 基于提供的真实数据进行分析
-- 正确使用公司名称"{company_name}"和股票代码"{ticker}"
-- 价格使用{currency_info}
-- 投资建议使用中文
-- 分析要详细且专业"""
+                analysis_prompt = get_prompt(
+                    "analysts/fundamentals",
+                    "analysis_prompt",
+                    company_name=company_name,
+                    ticker=ticker,
+                    combined_data=combined_data,
+                    currency_info=currency_info,
+                )
 
                 try:
                     # 创建简单的分析链
                     analysis_prompt_template = ChatPromptTemplate.from_messages([
-                        ("system", "你是专业的股票基本面分析师，基于提供的真实数据进行分析。"),
+                        ("system", get_prompt("analysts/fundamentals", "analysis_system")),
                         ("human", "{analysis_request}")
                     ])
                     
@@ -690,7 +636,7 @@ def create_fundamentals_analyst(llm, toolkit):
         logger.debug(f"📊 [DEBUG] 返回状态: fundamentals_report长度={len(result.content) if hasattr(result, 'content') else 0}")
         # 🔧 保持工具调用计数器不变（已在开始时根据ToolMessage更新）
         return {
-            "messages": [result],
+            "fundamentals_messages": [result],
             "fundamentals_report": result.content if hasattr(result, 'content') else str(result),
             "fundamentals_tool_call_count": tool_call_count
         }

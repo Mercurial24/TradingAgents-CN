@@ -12,6 +12,8 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 
+from tradingagents.config.prompt_manager import get_prompt
+
 logger = logging.getLogger(__name__)
 
 class GoogleToolCallHandler:
@@ -29,11 +31,12 @@ class GoogleToolCallHandler:
         tools: List[Any],
         state: Dict[str, Any],
         analysis_prompt_template: str,
-        analyst_name: str = "分析师"
+        analyst_name: str = "分析师",
+        messages_key: str = "messages"
     ) -> Tuple[str, List[Any]]:
         """
         统一处理Google模型的工具调用
-        
+
         Args:
             result: LLM的第一次调用结果
             llm: 语言模型实例
@@ -41,7 +44,8 @@ class GoogleToolCallHandler:
             state: 当前状态
             analysis_prompt_template: 分析提示词模板
             analyst_name: 分析师名称
-            
+            messages_key: 该分析师对应的消息通道键(并行化后各自独立)
+
         Returns:
             Tuple[str, List[Any]]: (分析报告, 消息列表)
         """
@@ -82,8 +86,8 @@ class GoogleToolCallHandler:
             logger.info(f"[{analyst_name}]   - 工具绑定可能存在问题")
             
             # 检查输入消息
-            if "messages" in state:
-                messages = state["messages"]
+            if messages_key in state:
+                messages = state[messages_key]
                 if not messages:
                     logger.warning(f"[{analyst_name}] ⚠️ 输入消息列表为空")
                 else:
@@ -236,9 +240,9 @@ class GoogleToolCallHandler:
             safe_messages = []
 
             # 只保留初始的用户消息（如果有）
-            if "messages" in state and state["messages"]:
+            if messages_key in state and state[messages_key]:
                 # 只保留第一条 HumanMessage（通常是初始任务描述）
-                for msg in state["messages"]:
+                for msg in state[messages_key]:
                     if isinstance(msg, HumanMessage):
                         safe_messages.append(msg)
                         logger.debug(f"[{analyst_name}] 📝 保留初始用户消息")
@@ -532,28 +536,13 @@ class GoogleToolCallHandler:
                         logger.debug(f"🔍 [{analyst_name}] 消息{i+1}: {msg_type}, 无content属性")
                 
                 # 构建分析提示 - 根据尝试次数调整
-                if attempt == 0:
-                    analysis_prompt = f"""
-                    基于以上工具调用的结果，请为{analyst_name}生成一份详细的分析报告。
-                    
-                    要求：
-                    1. 综合分析所有工具返回的数据
-                    2. 提供清晰的投资建议和风险评估
-                    3. 报告应该结构化且易于理解
-                    4. 包含具体的数据支撑和分析逻辑
-                    
-                    请生成完整的分析报告：
-                    """
-                elif attempt == 1:
-                    analysis_prompt = f"""
-                    请简要分析{analyst_name}的工具调用结果并提供投资建议。
-                    要求：简洁明了，包含关键数据和建议。
-                    """
-                else:
-                    analysis_prompt = f"""
-                    请为{analyst_name}提供一个简短的分析总结。
-                    """
-                
+                retry_keys = ("retry_prompt_0", "retry_prompt_1", "retry_prompt_2")
+                key = retry_keys[min(attempt, len(retry_keys) - 1)]
+                analysis_prompt = get_prompt(
+                    "shared/google_analysis",
+                    key,
+                    analyst_name=analyst_name,
+                )                
                 logger.debug(f"🔍 [{analyst_name}] 分析提示预览: {analysis_prompt[:100]}...")
                 
                 # 优化消息序列
@@ -730,22 +719,13 @@ class GoogleToolCallHandler:
             str: 分析提示词
         """
         
-        base_prompt = f"""现在请基于上述工具获取的数据，生成详细的{analyst_type}报告。
-
-**股票信息：**
-- 公司名称：{company_name}
-- 股票代码：{ticker}
-
-**分析要求：**
-1. 报告必须基于工具返回的真实数据进行分析
-2. 包含具体的数值和专业分析
-3. 提供明确的投资建议和风险提示
-4. 报告长度不少于800字
-5. 使用中文撰写
-6. 确保在分析中正确使用公司名称"{company_name}"和股票代码"{ticker}"
-
-{specific_requirements}
-
-请生成专业、详细的{analyst_type}报告。"""
+        base_prompt = get_prompt(
+            "shared/google_analysis",
+            "analysis_prompt",
+            analyst_type=analyst_type,
+            company_name=company_name,
+            ticker=ticker,
+            specific_requirements=specific_requirements or "",
+        )
         
         return base_prompt

@@ -78,6 +78,7 @@ dependencies = [
     "psutil>=6.1.0",
     "python-dotenv>=1.0.0",
     "pytz>=2025.2",
+    "PyYAML>=6.0.0",
     "questionary>=2.1.0",
     "rich>=14.0.0",
     "setuptools>=80.9.0",
@@ -96,3 +97,6 @@ tradingagents = "main:main"
 [tool.setuptools.packages.find]
 include = ["tradingagents*"]
 exclude = ["tests*", "docs*", "scripts*", "data*", "logs*", "reports*", "results*", "eval_results*", "upstream_contribution*"]
+
+[tool.setuptools.package-data]
+tradingagents = ["prompts/**/*.yaml", "prompts/**/*.yml", "prompts/**/*.md"]

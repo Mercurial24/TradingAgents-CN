@@ -5,6 +5,7 @@ from langchain_openai import ChatOpenAI
 # 导入统一日志系统和图处理模块日志装饰器
 from tradingagents.utils.logging_init import get_logger
 from tradingagents.utils.tool_logging import log_graph_module
+from tradingagents.config.prompt_manager import get_prompt
 logger = get_logger("graph.signal_processing")
 
 
@@ -63,34 +64,16 @@ class SignalProcessor:
         logger.info(f"🔍 [SignalProcessor] 处理信号: 股票={stock_symbol}, 市场={market_info['market_name']}, 货币={currency}",
                    extra={'stock_symbol': stock_symbol, 'market': market_info['market_name'], 'currency': currency})
 
+        system_prompt = get_prompt(
+            "graph/signal_processing",
+            "system_prompt",
+            currency=currency,
+            currency_symbol=currency_symbol,
+            stock_symbol=stock_symbol or "未知",
+            market_name=market_info["market_name"],
+        )
         messages = [
-            (
-                "system",
-                f"""您是一位专业的金融分析助手，负责从交易员的分析报告中提取结构化的投资决策信息。
-
-请从提供的分析报告中提取以下信息，并以JSON格式返回：
-
-{{
-    "action": "买入/持有/卖出",
-    "target_price": 数字({currency}价格，**必须提供具体数值，不能为null**),
-    "confidence": 数字(0-1之间，如果没有明确提及则为0.7),
-    "risk_score": 数字(0-1之间，如果没有明确提及则为0.5),
-    "reasoning": "决策的主要理由摘要"
-}}
-
-请确保：
-1. action字段必须是"买入"、"持有"或"卖出"之一（绝对不允许使用英文buy/hold/sell）
-2. target_price必须是具体的数字,target_price应该是合理的{currency}价格数字（使用{currency_symbol}符号）
-3. confidence和risk_score应该在0-1之间
-4. reasoning应该是简洁的中文摘要
-5. 所有内容必须使用中文，不允许任何英文投资建议
-
-特别注意：
-- 股票代码 {stock_symbol or '未知'} 是{market_info['market_name']}，使用{currency}计价
-- 目标价格必须与股票的交易货币一致（{currency_symbol}）
-
-如果某些信息在报告中没有明确提及，请使用合理的默认值。""",
-            ),
+            ("system", system_prompt),
             ("human", full_signal),
         ]
 
