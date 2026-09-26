@@ -23,19 +23,19 @@ from tradingagents.utils.logging_manager import get_logger
 logger = get_logger('agents')
 
 
-def create_msg_delete():
+def create_msg_delete(messages_key="messages"):
     def delete_messages(state):
-        """Clear messages and add placeholder for Anthropic compatibility"""
-        messages = state["messages"]
-        
+        """Clear 指定分析师的messages通道并添加占位消息(兼容Anthropic)"""
+        messages = state[messages_key]
+
         # Remove all messages
         removal_operations = [RemoveMessage(id=m.id) for m in messages]
-        
+
         # Add a minimal placeholder message
         placeholder = HumanMessage(content="Continue")
-        
-        return {"messages": removal_operations + [placeholder]}
-    
+
+        return {messages_key: removal_operations + [placeholder]}
+
     return delete_messages
 
 

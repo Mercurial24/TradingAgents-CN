@@ -20,7 +20,7 @@ class ConditionalLogic:
         from tradingagents.utils.logging_init import get_logger
         logger = get_logger("agents")
 
-        messages = state["messages"]
+        messages = state["market_messages"]
         last_message = messages[-1]
 
         # 死循环修复: 添加工具调用次数检查
@@ -65,7 +65,7 @@ class ConditionalLogic:
         from tradingagents.utils.logging_init import get_logger
         logger = get_logger("agents")
 
-        messages = state["messages"]
+        messages = state["social_messages"]
         last_message = messages[-1]
 
         # 死循环修复: 添加工具调用次数检查
@@ -103,7 +103,7 @@ class ConditionalLogic:
         from tradingagents.utils.logging_init import get_logger
         logger = get_logger("agents")
 
-        messages = state["messages"]
+        messages = state["news_messages"]
         last_message = messages[-1]
 
         # 死循环修复: 添加工具调用次数检查
@@ -141,7 +141,7 @@ class ConditionalLogic:
         from tradingagents.utils.logging_init import get_logger
         logger = get_logger("agents")
 
-        messages = state["messages"]
+        messages = state["fundamentals_messages"]
         last_message = messages[-1]
 
         # 死循环修复: 添加工具调用次数检查

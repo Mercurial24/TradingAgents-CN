@@ -106,21 +106,21 @@ class GraphSetup:
             analyst_nodes["market"] = create_market_analyst(
                 self.quick_thinking_llm, self.toolkit
             )
-            delete_nodes["market"] = create_msg_delete()
+            delete_nodes["market"] = create_msg_delete(messages_key="market_messages")
             tool_nodes["market"] = self.tool_nodes["market"]
 
         if "social" in selected_analysts:
             analyst_nodes["social"] = create_social_media_analyst(
                 self.quick_thinking_llm, self.toolkit
             )
-            delete_nodes["social"] = create_msg_delete()
+            delete_nodes["social"] = create_msg_delete(messages_key="social_messages")
             tool_nodes["social"] = self.tool_nodes["social"]
 
         if "news" in selected_analysts:
             analyst_nodes["news"] = create_news_analyst(
                 self.quick_thinking_llm, self.toolkit
             )
-            delete_nodes["news"] = create_msg_delete()
+            delete_nodes["news"] = create_msg_delete(messages_key="news_messages")
             tool_nodes["news"] = self.tool_nodes["news"]
 
         if "fundamentals" in selected_analysts:
@@ -147,7 +147,7 @@ class GraphSetup:
             analyst_nodes["fundamentals"] = create_fundamentals_analyst(
                 self.quick_thinking_llm, self.toolkit
             )
-            delete_nodes["fundamentals"] = create_msg_delete()
+            delete_nodes["fundamentals"] = create_msg_delete(messages_key="fundamentals_messages")
             tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
 
         # Create researcher and manager nodes
@@ -191,16 +191,15 @@ class GraphSetup:
         workflow.add_node("Safe Analyst", safe_analyst)
         workflow.add_node("Risk Judge", risk_manager_node)
 
-        # Define edges
-        # Start with the first analyst
-        first_analyst = selected_analysts[0]
-        workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
-
-        # Connect analysts in sequence
-        for i, analyst_type in enumerate(selected_analysts):
+        # Define edges — 分析师阶段并行化
+        # START fan-out 到每个分析师分支;各分支独立完成(分析师 ⇄ 工具循环 → Msg Clear);
+        # 所有 Msg Clear fan-in 汇聚到 Bull Researcher(LangGraph 会等每个分支都跑完后才执行)
+        for analyst_type in selected_analysts:
             current_analyst = f"{analyst_type.capitalize()} Analyst"
             current_tools = f"tools_{analyst_type}"
             current_clear = f"Msg Clear {analyst_type.capitalize()}"
+
+            workflow.add_edge(START, current_analyst)
 
             # Add conditional edges for current analyst
             workflow.add_conditional_edges(
@@ -210,12 +209,7 @@ class GraphSetup:
             )
             workflow.add_edge(current_tools, current_analyst)
 
-            # Connect to next analyst or to Bull Researcher if this is the last analyst
-            if i < len(selected_analysts) - 1:
-                next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
-                workflow.add_edge(current_clear, next_analyst)
-            else:
-                workflow.add_edge(current_clear, "Bull Researcher")
+            workflow.add_edge(current_clear, "Bull Researcher")
 
         # Add remaining edges
         workflow.add_conditional_edges(

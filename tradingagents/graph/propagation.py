@@ -28,9 +28,15 @@ class Propagator:
         # 🔥 修复：创建明确的分析请求消息，而不是只传递股票代码
         # 这样可以确保所有LLM（包括DeepSeek）都能理解任务
         analysis_request = f"请对股票 {company_name} 进行全面分析，交易日期为 {trade_date}。"
+        seed_message = HumanMessage(content=analysis_request)
 
         return {
-            "messages": [HumanMessage(content=analysis_request)],
+            "messages": [seed_message],
+            # 每个分析师各自的消息通道都收到同一份分析请求,并发互不干扰
+            "market_messages": [seed_message],
+            "social_messages": [seed_message],
+            "news_messages": [seed_message],
+            "fundamentals_messages": [seed_message],
             "company_of_interest": company_name,
             "trade_date": str(trade_date),
             "investment_debate_state": InvestDebateState(

@@ -633,6 +633,7 @@ class TradingAgentsGraph:
 
         注意：ToolNode 包含所有可能的工具，但 LLM 只会调用它绑定的工具。
         ToolNode 的作用是执行 LLM 生成的 tool_calls，而不是限制 LLM 可以调用哪些工具。
+        并行化后每个分析师走自己的消息通道(messages_key),工具执行结果写回对应通道。
         """
         return {
             "market": ToolNode(
@@ -645,7 +646,8 @@ class TradingAgentsGraph:
                     # 离线工具（备用）
                     self.toolkit.get_YFin_data,
                     self.toolkit.get_stockstats_indicators_report,
-                ]
+                ],
+                messages_key="market_messages",
             ),
             "social": ToolNode(
                 [
@@ -655,7 +657,8 @@ class TradingAgentsGraph:
                     self.toolkit.get_stock_news_openai,
                     # 离线工具（备用）
                     self.toolkit.get_reddit_stock_info,
-                ]
+                ],
+                messages_key="social_messages",
             ),
             "news": ToolNode(
                 [
@@ -667,7 +670,8 @@ class TradingAgentsGraph:
                     # 离线工具（备用）
                     self.toolkit.get_finnhub_news,
                     self.toolkit.get_reddit_news,
-                ]
+                ],
+                messages_key="news_messages",
             ),
             "fundamentals": ToolNode(
                 [
@@ -682,7 +686,8 @@ class TradingAgentsGraph:
                     # 中国市场工具（备用）
                     self.toolkit.get_china_stock_data,
                     self.toolkit.get_china_fundamentals,
-                ]
+                ],
+                messages_key="fundamentals_messages",
             ),
         }
 
